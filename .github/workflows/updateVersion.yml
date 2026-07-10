@@ -1,0 +1,109 @@
+name: Update Ginger release links
+
+on:
+  repository_dispatch:
+    types: [update-version]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, with or without the leading v.
+        required: true
+      release_repository:
+        description: Repository that hosts the GitHub release assets.
+        required: true
+        default: GingerPrivacy/GingerWallet
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-version:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout website
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Resolve inputs
+        id: release
+        env:
+          DISPATCH_VERSION: ${{ github.event.client_payload.new_version }}
+          DISPATCH_RELEASE_REPOSITORY: ${{ github.event.client_payload.release_repository }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_RELEASE_REPOSITORY: ${{ inputs.release_repository }}
+        run: |
+          set -euo pipefail
+          version="${DISPATCH_VERSION:-$INPUT_VERSION}"
+          release_repository="${DISPATCH_RELEASE_REPOSITORY:-$INPUT_RELEASE_REPOSITORY}"
+          release_repository="${release_repository:-GingerPrivacy/GingerWallet}"
+
+          if [ -z "$version" ]; then
+            echo "Missing release version." >&2
+            exit 1
+          fi
+
+          version="${version#v}"
+          safe_version="$(printf '%s' "$version" | sed -E 's/[^A-Za-z0-9._-]+/-/g')"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "safe_version=$safe_version" >> "$GITHUB_OUTPUT"
+          echo "release_repository=$release_repository" >> "$GITHUB_OUTPUT"
+
+      - name: Create update branch
+        run: |
+          set -euo pipefail
+          git switch -c "update-release-links-v${{ steps.release.outputs.safe_version }}"
+
+      - name: Update wwwroot/index.html
+        run: |
+          node .github/scripts/update-release-links.mjs \
+            "${{ steps.release.outputs.version }}" \
+            "${{ steps.release.outputs.release_repository }}"
+
+      - name: Commit and push changes
+        id: changes
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- wwwroot/index.html; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No release link changes detected."
+            exit 0
+          fi
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add wwwroot/index.html
+          git commit -m "Update release links to ${{ steps.release.outputs.version }}"
+          git push --force-with-lease origin "update-release-links-v${{ steps.release.outputs.safe_version }}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update pull request
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: update-release-links-v${{ steps.release.outputs.safe_version }}
+          VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_REPOSITORY: ${{ steps.release.outputs.release_repository }}
+        run: |
+          set -euo pipefail
+
+          existing_url="$(gh pr list --head "$BRANCH_NAME" --state open --json url --jq '.[0].url // empty')"
+          if [ -n "$existing_url" ]; then
+            echo "Pull request already exists: $existing_url"
+            exit 0
+          fi
+
+          gh pr create \
+            --base master \
+            --head "$BRANCH_NAME" \
+            --title "Update release links to $VERSION" \
+            --body "Updates the website download links to Ginger Wallet $VERSION from $RELEASE_REPOSITORY."
